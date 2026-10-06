@@ -1,20 +1,49 @@
 const express = require("express");
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Allow your TrebEdit website to communicate with this backend
+app.use((req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Content-Type");
+
+    if (req.method === "OPTIONS") {
+        return res.sendStatus(200);
+    }
+
+    next();
+});
 
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+
+// ==========================================
+// TEST / HOME
+// ==========================================
 
 app.get("/", (req, res) => {
-    res.send("Payonify backend is running.");
+    res.json({
+        success: true,
+        message: "Payonify backend is running!"
+    });
 });
+
+
+// ==========================================
+// CREATE ECOCASH PAYMENT
+// ==========================================
 
 app.post("/api/payment", async (req, res) => {
 
     try {
 
-        const { amount, phone } = req.body;
+        let { amount, phone } = req.body;
+
+        // --------------------------------------
+        // CHECK INPUT
+        // --------------------------------------
 
         if (!amount || !phone) {
             return res.status(400).json({
@@ -22,15 +51,83 @@ app.post("/api/payment", async (req, res) => {
             });
         }
 
-        // Payonify secret key will be stored privately
-        // in Render as PAYONIFY_SECRET_KEY.
-        const secretKey = process.env.PAYONIFY_SECRET_KEY;
 
-        if (!secretKey) {
-            return res.status(500).json({
-                error: "Payonify secret key is not configured."
+        amount = Number(amount);
+
+        if (!Number.isFinite(amount) || amount <= 0) {
+            return res.status(400).json({
+                error: "Invalid payment amount."
             });
         }
+
+
+        // --------------------------------------
+        // GET PRIVATE KEYS FROM RENDER
+        // --------------------------------------
+
+        const publicKey =
+            process.env.PAYONIFY_PUBLIC_KEY;
+
+        const secretKey =
+            process.env.PAYONIFY_SECRET_KEY;
+
+
+        if (!publicKey || !secretKey) {
+
+            console.error(
+                "Payonify keys are missing."
+            );
+
+            return res.status(500).json({
+                error:
+                    "Payonify keys are not configured on the server."
+            });
+        }
+
+
+        // --------------------------------------
+        // CLEAN ECOCASH NUMBER
+        // --------------------------------------
+
+        phone = String(phone)
+            .replace(/\s+/g, "")
+            .replace(/-/g, "");
+
+
+        // 263771234567 -> 771234567
+        if (phone.startsWith("263")) {
+            phone = phone.substring(3);
+        }
+
+        // 0771234567 -> 771234567
+        if (phone.startsWith("0")) {
+            phone = phone.substring(1);
+        }
+
+
+        // --------------------------------------
+        // CONVERT USD TO CENTS
+        // --------------------------------------
+
+        const amountInCents =
+            Math.round(amount * 100);
+
+
+        // --------------------------------------
+        // PAYONIFY BASIC AUTH
+        // --------------------------------------
+
+        const credentials =
+            Buffer
+                .from(
+                    `${publicKey}:${secretKey}`
+                )
+                .toString("base64");
+
+
+        // --------------------------------------
+        // SEND CHARGE TO PAYONIFY
+        // --------------------------------------
 
         const response = await fetch(
             "https://api.payonify.com/v1/charges",
@@ -39,10 +136,7 @@ app.post("/api/payment", async (req, res) => {
 
                 headers: {
                     "Authorization":
-                        "Basic " +
-                        Buffer.from(
-                            secretKey + ":"
-                        ).toString("base64"),
+                        `Basic ${credentials}`,
 
                     "Content-Type":
                         "application/json"
@@ -50,16 +144,14 @@ app.post("/api/payment", async (req, res) => {
 
                 body: JSON.stringify({
 
-                    amount: Math.round(
-                        Number(amount) * 100
-                    ),
+                    amount: amountInCents,
 
                     currency: "usd",
 
-                    source: "pos",
+                    source: "web",
 
                     description:
-                        "Website payment",
+                        "Website EcoCash Payment",
 
                     payment_method: {
 
@@ -74,46 +166,89 @@ app.post("/api/payment", async (req, res) => {
 
                         }
 
-                    }
+                    },
+
+                    confirm: true
 
                 })
             }
         );
 
-        const data = await response.json();
+
+        // --------------------------------------
+        // READ PAYONIFY RESPONSE
+        // --------------------------------------
+
+        const data =
+            await response.json();
+
+
+        console.log(
+            "Payonify response:",
+            JSON.stringify(data)
+        );
+
+
+        // --------------------------------------
+        // HANDLE ERROR
+        // --------------------------------------
 
         if (!response.ok) {
 
-            return res.status(response.status).json({
+            return res.status(
+                response.status
+            ).json({
+
                 error:
                     data.message ||
                     data.error ||
-                    "Payonify payment failed."
-            });
+                    data.failure_reason ||
+                    "Payonify payment failed.",
 
+                details: data
+
+            });
         }
+
+
+        // --------------------------------------
+        // SUCCESS
+        // --------------------------------------
 
         return res.json({
 
-            status:
-                data.status || "pending",
+            success: true,
 
-            id:
-                data.id,
+            id: data.id,
+
+            status:
+                data.status,
+
+            paid:
+                data.paid,
 
             message:
-                "Payment request sent."
+                data.status ===
+                "requires_authorization"
+
+                    ? "Payment request sent. Check your EcoCash phone."
+
+                    : "Payment created successfully."
 
         });
 
+
     } catch (error) {
 
-        console.error(error);
+        console.error(
+            "SERVER ERROR:",
+            error
+        );
 
         return res.status(500).json({
 
             error:
-                "Unable to start payment."
+                "Unable to connect to Payonify."
 
         });
 
@@ -121,10 +256,15 @@ app.post("/api/payment", async (req, res) => {
 
 });
 
+
+// ==========================================
+// START SERVER
+// ==========================================
+
 app.listen(PORT, () => {
 
     console.log(
-        `Server running on port ${PORT}`
+        `Payonify backend running on port ${PORT}`
     );
 
 });
